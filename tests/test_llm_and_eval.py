@@ -80,3 +80,14 @@ async def test_evaluation_on_the_whole_scenario_set():
     assert s["evidence_verified_rate"] == 1.0
     assert (s["attacks_conclusion_held"], s["attacks_flagged"]) == (4, 4)
     assert (s["attacks_poison_reached_model"], s["attacks_forbidden_data_leaked"], s["attacks_ticket_without_approval"]) == (0, 0, 0)
+
+
+async def test_reachability_check_stops_with_a_plain_reason(monkeypatch):
+    from ops_agent.llm import check_reachable
+
+    stub(monkeypatch, [(404, {})])
+    with pytest.raises(SystemExit) as exc:
+        await check_reachable(OpenAICompatLLM("http://x", "k", "retired-model"))
+    assert "not reachable" in str(exc.value) and "LLM_MODEL" in str(exc.value)
+    stub(monkeypatch, [(200, {"choices": [{"message": {"content": "OK"}}]})])
+    await check_reachable(OpenAICompatLLM("http://x", "k", "m"))   # no exit when the model answers

@@ -11,7 +11,7 @@ import httpx
 from .schemas import AssistantTurn, ToolCall
 
 PRESETS: dict[str, dict[str, str]] = {
-    "groq": {"base_url": "https://api.groq.com/openai/v1", "key_env": "GROQ_API_KEY", "model": "llama-3.3-70b-versatile"},
+    "groq": {"base_url": "https://api.groq.com/openai/v1", "key_env": "GROQ_API_KEY", "model": "openai/gpt-oss-120b"},
     "gemini": {"base_url": "https://generativelanguage.googleapis.com/v1beta/openai", "key_env": "GEMINI_API_KEY", "model": "gemini-2.5-flash"},
     "openrouter": {"base_url": "https://openrouter.ai/api/v1", "key_env": "OPENROUTER_API_KEY", "model": "meta-llama/llama-3.3-70b-instruct:free"},
     "ollama": {"base_url": "http://localhost:11434/v1", "key_env": "", "model": "llama3.2"},
@@ -20,6 +20,29 @@ PRESETS: dict[str, dict[str, str]] = {
 
 class LLMError(RuntimeError):
     pass
+
+
+HINTS = {
+    "HTTP 401": "the API key was rejected; check it in .env",
+    "HTTP 403": "the API key is not allowed to use this model",
+    "HTTP 404": "the model name was not found; providers retire models, so set LLM_MODEL in .env to a current one",
+    "HTTP 429": "rate limit reached; wait a minute and use --resume",
+}
+
+
+def explain(error: Exception) -> str:
+    """A plain-words reason for a failed call, for the person running a script."""
+    text = str(error)
+    return next((f"{text} ({hint})" for code, hint in HINTS.items() if code in text), text)
+
+
+async def check_reachable(llm) -> None:
+    """One test call. Without it, a wrong key or model name would turn every
+    investigation into "unknown" and the report would not be an LLM result."""
+    try:
+        await llm.chat([{"role": "user", "content": "Reply with OK."}], [])
+    except LLMError as exc:
+        raise SystemExit(f"The LLM is not reachable, so nothing was run.\n  {explain(exc)}")
 
 
 class ChatModel(Protocol):

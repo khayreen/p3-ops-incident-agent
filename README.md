@@ -139,7 +139,7 @@ ops_agent/
   runner.py       wires scenario + MCP + gateway + graph;  cli.py is the terminal entry point
 scenarios/        24 failure scenarios, 4 attack scenarios, and the generator
 eval/run_eval.py  accuracy and attack metrics
-tests/            94 tests
+tests/            95 tests
 ```
 
 ## License

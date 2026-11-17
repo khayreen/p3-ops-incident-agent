@@ -9,7 +9,7 @@ import argparse
 import asyncio
 import json
 
-from .llm import OpenAICompatLLM
+from .llm import OpenAICompatLLM, check_reachable
 from .playbook import PlaybookPolicy
 from .runner import open_investigation, write_trace
 from .tickets import TicketSink
@@ -27,6 +27,8 @@ async def main() -> None:
     args = ap.parse_args()
 
     llm = OpenAICompatLLM.from_env() if args.policy == "llm" else PlaybookPolicy()
+    if args.policy == "llm":
+        await check_reachable(llm)
     async with open_investigation(args.scenario, llm, TicketSink(args.tickets), args.transport) as (investigator, scenario):
         print(f"\n{scenario['question']}\nInvestigator: {llm.name}   MCP transport: {args.transport}\n")
         report = await investigator.run(scenario["job"], scenario["question"])

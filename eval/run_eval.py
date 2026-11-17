@@ -17,7 +17,7 @@ import tempfile
 from datetime import date
 from pathlib import Path
 
-from ops_agent.llm import OpenAICompatLLM
+from ops_agent.llm import OpenAICompatLLM, check_reachable
 from ops_agent.playbook import PlaybookPolicy
 from ops_agent.runner import open_investigation
 from ops_agent.schemas import AssistantTurn
@@ -130,6 +130,7 @@ async def main() -> None:
 
     if args.policy == "llm":
         inner = OpenAICompatLLM.from_env()
+        await check_reachable(inner)
         llm, title = Paced(inner, args.sleep), f"LLM agent ({inner.name})"
     else:
         llm, title = PlaybookPolicy(), "rule-based playbook (no LLM)"
