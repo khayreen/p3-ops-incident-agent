@@ -71,6 +71,8 @@ class State(TypedDict, total=False):
     job: str
     messages: list[dict]
     invalid_output: bool
+    llm_error: str          # set when a call returned no model answer
+    llm_model_fault: bool   # True when that was the model's own fault (a malformed tool call)
     report: dict
     approved: bool
     approved_by: str
@@ -91,10 +93,11 @@ def _norm(text: str) -> str:
     return re.sub(r"\s+", " ", text).strip().lower()
 
 
-def build_report(job: str, finding: Finding, gateway: ToolGateway, invalid_output: bool) -> Report:
+def build_report(job: str, finding: Finding, gateway: ToolGateway, invalid_output: bool,
+                 extra_reasons: tuple[str, ...] = ()) -> Report:
     shown = _norm(" \n ".join(gateway.shown))
     verified = sum(1 for quote in finding.evidence if len(_norm(quote)) >= 8 and _norm(quote) in shown)
-    reasons = []
+    reasons = list(extra_reasons)
     if invalid_output:
         reasons.append("invalid_output")
     if finding.root_cause is RootCause.unknown:
@@ -125,9 +128,10 @@ def build_graph(llm: ChatModel, gateway: ToolGateway, sink: TicketSink, max_turn
             messages.append({"role": "user", "content": BUDGET_NOTICE})
         try:
             turn = await llm.chat(messages, [] if out_of_budget else tools)
-        except LLMError:
-            messages.append({"role": "assistant", "content": ""})
-            return {"messages": messages}
+        except LLMError as exc:
+            # No answer came back. Do not invent an empty one: go straight to a
+            # manual-review conclusion and record why.
+            return {"messages": messages, "llm_error": str(exc), "llm_model_fault": exc.model_fault}
         message: dict = {"role": "assistant", "content": turn.content}
         if turn.tool_calls and not out_of_budget:
             message["tool_calls"] = [
@@ -138,6 +142,8 @@ def build_graph(llm: ChatModel, gateway: ToolGateway, sink: TicketSink, max_turn
         return {"messages": messages}
 
     def after_investigate(state: State) -> str:
+        if state.get("llm_error"):
+            return "conclude"
         return "tools" if state["messages"][-1].get("tool_calls") else "conclude"
 
     async def run_tools(state: State) -> State:
@@ -153,22 +159,24 @@ def build_graph(llm: ChatModel, gateway: ToolGateway, sink: TicketSink, max_turn
 
     async def conclude(state: State) -> State:
         messages = list(state["messages"])
-        finding = parse_finding(messages[-1].get("content", ""))
+        llm_error, model_fault = state.get("llm_error", ""), state.get("llm_model_fault", False)
+        finding = None if llm_error else parse_finding(messages[-1].get("content", ""))
         invalid = False
-        if finding is None:  # one retry, without tools
+        if finding is None and not llm_error:  # one retry, without tools
             messages.append({"role": "user", "content": RETRY_NOTICE})
             try:
                 turn = await llm.chat(messages, [])
                 messages.append({"role": "assistant", "content": turn.content})
                 finding = parse_finding(turn.content)
-            except LLMError:
-                finding = None
+            except LLMError as exc:
+                llm_error, model_fault = str(exc), exc.model_fault
         if finding is None:
             invalid = True
             finding = Finding(root_cause=RootCause.unknown, confidence=0.0,
                               summary="The investigator did not produce a valid conclusion. Investigate manually.")
-        report = build_report(state["job"], finding, gateway, invalid)
-        return {"messages": messages, "invalid_output": invalid, "report": report.model_dump(mode="json")}
+        extra = (("llm_error" if model_fault else "llm_unavailable"),) if llm_error else ()
+        report = build_report(state["job"], finding, gateway, invalid, extra)
+        return {"messages": messages, "invalid_output": invalid, "llm_error": llm_error, "report": report.model_dump(mode="json")}
 
     async def approval(state: State) -> State:
         decision = interrupt({"report": state["report"]})

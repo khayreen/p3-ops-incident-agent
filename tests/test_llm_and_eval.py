@@ -91,3 +91,43 @@ async def test_reachability_check_stops_with_a_plain_reason(monkeypatch):
     assert "not reachable" in str(exc.value) and "LLM_MODEL" in str(exc.value)
     stub(monkeypatch, [(200, {"choices": [{"message": {"content": "OK"}}]})])
     await check_reachable(OpenAICompatLLM("http://x", "k", "m"))   # no exit when the model answers
+
+
+async def test_daily_limit_stops_at_once_and_says_so(monkeypatch):
+    daily = {"error": {"code": "rate_limit_exceeded", "message": "Rate limit reached on tokens per day (TPD): Limit 200000"}}
+    sent = stub(monkeypatch, [(429, daily, {"retry-after": "600"})])
+    with pytest.raises(LLMError) as exc:
+        await OpenAICompatLLM("http://x", "k", "m").chat([], [])
+    assert len(sent) == 1 and exc.value.daily_limit and not exc.value.model_fault
+    assert "resets within 24 hours" in llm_module.explain(exc.value)
+
+
+async def test_per_minute_limits_are_waited_out(monkeypatch):
+    minute = {"error": {"code": "rate_limit_exceeded", "message": "Rate limit reached on tokens per minute (TPM)"}}
+    sent = stub(monkeypatch, [(429, minute, {"retry-after": "7"})] * 5 + [(200, OK)])
+    assert (await OpenAICompatLLM("http://x", "k", "m").chat([], [])).tool_calls and len(sent) == 6
+
+
+async def test_malformed_tool_calls_are_retried_then_blamed_on_the_model(monkeypatch):
+    bad = {"error": {"code": "tool_use_failed", "message": "Failed to call a function."}}
+    sent = stub(monkeypatch, [(400, bad), (200, OK)])
+    assert (await OpenAICompatLLM("http://x", "k", "m").chat([], [])).tool_calls and len(sent) == 2
+    sent = stub(monkeypatch, [(400, bad)])
+    with pytest.raises(LLMError) as exc:
+        await OpenAICompatLLM("http://x", "k", "m").chat([], [])
+    assert len(sent) == 3 and exc.value.model_fault and "tool_use_failed" in str(exc.value)
+
+
+async def test_token_use_is_counted(monkeypatch):
+    stub(monkeypatch, [(200, {**OK, "usage": {"total_tokens": 1234}})])
+    model = OpenAICompatLLM("http://x", "k", "m")
+    await model.chat([], [])
+    assert model.tokens_used == 1234
+
+
+async def test_a_scenario_with_a_failed_call_is_marked_not_scored():
+    from .conftest import ScriptedLLM
+    row = await run_one(sorted(SCENARIOS.glob("S07_*.json"))[0], ScriptedLLM(LLMError("HTTP 429")), "memory")
+    assert row["llm_unavailable"] is True and row["format"] == 2
+    row = await run_one(sorted(SCENARIOS.glob("S07_*.json"))[0], PlaybookPolicy(), "memory")
+    assert row["llm_unavailable"] is False

@@ -6,6 +6,12 @@ behaves on the poisoned-log attack scenarios.
   python -m eval.run_eval --policy llm --resume    # continue an interrupted run
 
 Writes results/<policy>.md and results/<policy>.json.
+
+A scenario where an LLM call failed (rate limit, network, server error) is not
+scored and not saved, so --resume runs it again. A full LLM run is about 200
+calls and 350,000 tokens; Groq's free tier allows 8,000 tokens a minute and
+200,000 a day, so it takes two sittings. When the daily limit is reached the
+run stops cleanly and says so.
 """
 from __future__ import annotations
 
@@ -17,13 +23,14 @@ import tempfile
 from datetime import date
 from pathlib import Path
 
-from ops_agent.llm import OpenAICompatLLM, check_reachable
+from ops_agent.llm import LLMError, OpenAICompatLLM, check_reachable
 from ops_agent.playbook import PlaybookPolicy
 from ops_agent.runner import open_investigation
 from ops_agent.schemas import AssistantTurn
 from ops_agent.tickets import TicketSink
 
 ROOT = Path(__file__).resolve().parent.parent
+ROW_FORMAT = 2   # rows from before failed calls were kept out of the score are not reused by --resume
 
 
 class Paced:
@@ -31,12 +38,17 @@ class Paced:
 
     def __init__(self, inner, delay: float):
         self.inner, self.delay, self.name, self.calls = inner, delay, inner.name, 0
+        self.last_error, self.daily_limit = "", False
 
     async def chat(self, messages: list[dict], tools: list[dict]) -> AssistantTurn:
         if self.calls and self.delay:
             await asyncio.sleep(self.delay)
         self.calls += 1
-        return await self.inner.chat(messages, tools)
+        try:
+            return await self.inner.chat(messages, tools)
+        except LLMError as exc:
+            self.last_error, self.daily_limit = str(exc), self.daily_limit or exc.daily_limit
+            raise
 
 
 async def run_one(path: Path, llm, transport: str) -> dict:
@@ -48,6 +60,7 @@ async def run_one(path: Path, llm, transport: str) -> dict:
             tickets_before_approval = sink.count()
     attack = scenario.get("attack")
     row = {
+        "format": ROW_FORMAT, "llm_unavailable": "llm_unavailable" in report.needs_review_reasons,
         "id": scenario["id"], "job": scenario["job"], "expected": scenario["truth"]["root_cause"],
         "got": report.finding.root_cause.value, "correct": report.finding.root_cause.value == scenario["truth"]["root_cause"],
         "tool_calls": report.tool_calls, "denied_calls": report.denied_calls, "quarantined": report.quarantined_lines,
@@ -90,10 +103,14 @@ def summarise(rows: list[dict]) -> dict:
     }
 
 
-def to_markdown(title: str, s: dict, rows: list[dict]) -> str:
+def to_markdown(title: str, s: dict, rows: list[dict], remaining: int = 0) -> str:
     out = [
         f"# Evaluation: {title}", "",
         f"Run on {date.today().isoformat()} against {s['scenarios']} failure scenarios and {s['attacks']} attack scenarios.", "",
+    ]
+    if remaining:
+        out += [f"**Incomplete: {remaining} scenarios not yet run. Do not quote these numbers.**", ""]
+    out += [
         "## Root-cause accuracy", "", "| Metric | Result |", "|---|---|",
         f"| Correct root cause | {s['correct']} of {s['scenarios']} ({s['accuracy']:.1%}) |",
         f"| Average tool calls per investigation | {s['avg_tool_calls']} |",
@@ -123,7 +140,7 @@ async def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--policy", choices=["playbook", "llm"], default="playbook")
     ap.add_argument("--transport", choices=["memory", "stdio"], default="memory")
-    ap.add_argument("--sleep", type=float, default=2.5, help="seconds between LLM calls")
+    ap.add_argument("--sleep", type=float, default=15, help="seconds between LLM calls (Groq free tier: 8,000 tokens a minute)")
     ap.add_argument("--only", default="", help="comma-separated scenario IDs, e.g. S06,A02")
     ap.add_argument("--resume", action="store_true", help="skip scenarios already in the runs file")
     args = ap.parse_args()
@@ -140,11 +157,16 @@ async def main() -> None:
     runs_file = results / f"{args.policy}_runs.jsonl"
     done: dict[str, dict] = {}
     if args.resume and runs_file.exists():
-        done = {r["id"]: r for r in map(json.loads, runs_file.read_text(encoding="utf-8").splitlines())}
+        saved = [json.loads(line) for line in runs_file.read_text(encoding="utf-8").splitlines() if line.strip()]
+        done = {r["id"]: r for r in saved if r.get("format") == ROW_FORMAT and not r.get("llm_unavailable")}
+        if len(done) < len(saved):
+            print(f"Ignoring {len(saved) - len(done)} saved rows from an older run format; those scenarios will be run again.")
+            runs_file.write_text("".join(json.dumps(r, ensure_ascii=False) + "\n" for r in done.values()), encoding="utf-8")
     else:
         runs_file.write_text("", encoding="utf-8")
 
     paths = sorted((ROOT / "scenarios").glob("*.json"))
+    stopped = ""
     if args.only:
         wanted = {x.strip() for x in args.only.split(",")}
         paths = [p for p in paths if p.name.split("_")[0] in wanted]
@@ -157,17 +179,31 @@ async def main() -> None:
         except Exception as exc:  # keep going; a rate-limit failure should not lose the run
             print(f"{sid}: FAILED TO RUN ({type(exc).__name__}: {exc}). Re-run with --resume.", file=sys.stderr)
             continue
+        if row["llm_unavailable"]:
+            print(f"{sid}: NOT SCORED, an LLM call failed ({getattr(llm, 'last_error', '') or 'no detail'}). It will run again with --resume.")
+            if getattr(llm, "daily_limit", False):
+                stopped = "the provider's daily limit was reached"
+                break
+            continue
         done[sid] = row
         with runs_file.open("a", encoding="utf-8") as fh:
             fh.write(json.dumps(row, ensure_ascii=False) + "\n")
         print(f"{sid}: {'ok  ' if row['correct'] else 'MISS'} expected={row['expected']} got={row['got']} calls={row['tool_calls']} denied={row['denied_calls']}")
 
+    tokens = getattr(getattr(llm, "inner", None), "tokens_used", 0)
+    if tokens:
+        print(f"\nTokens used this sitting: {tokens:,}")
+    remaining = len([p for p in paths if p.name.split("_")[0] not in done])
+    if stopped:
+        print(f"Stopped: {stopped}. {remaining} scenarios are left; when the limit resets, run the same command with --resume.")
+    elif remaining:
+        print(f"{remaining} scenarios did not finish; run the same command with --resume.")
     rows = [done[k] for k in sorted(done)]
     if not rows:
-        sys.exit("no scenarios were run")
+        sys.exit("no scenarios were scored")
     summary = summarise(rows)
     (results / f"{args.policy}.json").write_text(json.dumps({"title": title, "summary": summary, "rows": rows}, indent=2), encoding="utf-8")
-    (results / f"{args.policy}.md").write_text(to_markdown(title, summary, rows), encoding="utf-8")
+    (results / f"{args.policy}.md").write_text(to_markdown(title, summary, rows, remaining), encoding="utf-8")
     print(f"\n{title}\n  root cause correct : {summary['correct']} of {summary['scenarios']} ({summary['accuracy']:.1%})")
     print(f"  attacks: conclusion held {summary['attacks_conclusion_held']}/{summary['attacks']}, flagged {summary['attacks_flagged']}/{summary['attacks']}, "
           f"out-of-scope data leaked {summary['attacks_forbidden_data_leaked']}, tickets without approval {summary['attacks_ticket_without_approval']}")

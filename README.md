@@ -52,7 +52,7 @@ Measured on 24 simulated failure scenarios (8 root causes, 3 variants each) and 
 
 Reproduce the first column with no API key: `python -m eval.run_eval --policy playbook`. Full report: [`results/playbook.md`](results/playbook.md).
 
-To fill in the LLM column, set an API key and run `python -m eval.run_eval --policy llm`. It makes about 200 model calls, so on a free tier expect 10 to 20 minutes. If it stops on a rate limit, continue with `--resume`.
+To fill in the LLM column, set an API key and run `python -m eval.run_eval --policy llm`. It makes about 200 model calls and uses about 350,000 tokens, so on Groq's free tier (200,000 tokens a day) it takes two sittings: it stops cleanly at the daily limit, and `--resume` continues. A scenario where a call failed (rate limit, network) is never scored as the model's answer; it is run again.
 
 **Read these numbers with care:**
 
@@ -139,7 +139,7 @@ ops_agent/
   runner.py       wires scenario + MCP + gateway + graph;  cli.py is the terminal entry point
 scenarios/        24 failure scenarios, 4 attack scenarios, and the generator
 eval/run_eval.py  accuracy and attack metrics
-tests/            95 tests
+tests/            102 tests
 ```
 
 ## License

@@ -157,3 +157,22 @@ async def test_playbook_known_miss_is_reported_honestly_as_unknown(investigate):
         report = await inv.run(sc["job"], sc["question"])
     assert sc["truth"]["root_cause"] == "config_error" and report.finding.root_cause is RootCause.unknown
     assert "no_conclusion" in report.needs_review_reasons
+
+
+async def test_a_failed_llm_call_is_not_turned_into_an_answer(investigate):
+    # A rate limit mid-investigation: the next call must not see an invented empty
+    # reply, and the report must say the LLM was unavailable, so the evaluation
+    # does not score it as the model's conclusion.
+    llm = ScriptedLLM(tool("get_recent_runs", job=JOB), LLMError("HTTP 429"))
+    async with investigate("S07", llm) as (inv, sc):
+        report = await inv.run(sc["job"], sc["question"])
+        sent = await inv.messages()
+    assert report.finding.root_cause is RootCause.unknown and "llm_unavailable" in report.needs_review_reasons
+    assert len(llm.calls) == 2 and not any(m["role"] == "assistant" and not m.get("content") and not m.get("tool_calls") for m in sent)
+
+
+async def test_a_malformed_tool_call_is_the_models_own_failure(investigate):
+    llm = ScriptedLLM(LLMError("HTTP 400 tool_use_failed", model_fault=True))
+    async with investigate("S07", llm) as (inv, sc):
+        report = await inv.run(sc["job"], sc["question"])
+    assert "llm_error" in report.needs_review_reasons and "llm_unavailable" not in report.needs_review_reasons
