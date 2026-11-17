@@ -131,3 +131,11 @@ async def test_a_scenario_with_a_failed_call_is_marked_not_scored():
     assert row["llm_unavailable"] is True and row["format"] == 2
     row = await run_one(sorted(SCENARIOS.glob("S07_*.json"))[0], PlaybookPolicy(), "memory")
     assert row["llm_unavailable"] is False
+
+
+async def test_the_providers_wait_time_is_kept_in_the_message(monkeypatch):
+    long = "Rate limit reached for model `m` in organization `o` service tier `on_demand` on tokens per day (TPD): " + "x" * 150 + " Please try again in 7h12m30.5s. Need more tokens?"
+    stub(monkeypatch, [(429, {"error": {"code": "rate_limit_exceeded", "message": long}})])
+    with pytest.raises(LLMError) as exc:
+        await OpenAICompatLLM("http://x", "k", "m").chat([], [])
+    assert "try again in 7h12m30.5s" in str(exc.value)

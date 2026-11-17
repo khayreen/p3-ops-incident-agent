@@ -4,6 +4,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import re
 from typing import Protocol
 
 import httpx
@@ -142,7 +143,12 @@ def error_detail(r: httpx.Response) -> tuple[str, str]:
         return "", ""
     code = err.get("code") if isinstance(err.get("code"), str) else ""
     message = err.get("message") if isinstance(err.get("message"), str) else ""
-    return code, message[:200]
+    # Keep the provider's "try again in ..." hint even when the message is long.
+    wait = re.search(r"try again in [0-9hms.]+", message)
+    short = message[:200]
+    if wait and wait.group(0) not in short:
+        short = f"{short.rstrip('. ')}... {wait.group(0)}"
+    return code, short
 
 
 def retry_wait(r: httpx.Response, attempt: int) -> float:
